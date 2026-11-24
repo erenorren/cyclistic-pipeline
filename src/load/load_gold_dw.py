@@ -174,32 +174,45 @@ def load_month_to_gold(month_str: str, base_data_dir: str = "/opt/airflow/data")
         # 1. Pastikan struktur tabel & dimensi statis tersedia
         init_schema_and_static_dims(conn, ddl_path)
 
-        # 2. Baca partisi Silver bulan terkait & terapkan filter pengaman ekstra (TEST / HQ QR)
+        # 2. Baca partisi Silver bulan terkait & bersihkan ID '.0', stasiun uji coba, serta koordinat luar Chicago
         df_silver = spark.read.parquet(silver_partition)
-        extra_excluded_stations = [
-            "BASE - 2132 W HUBBARD WAREHOUSE",
-            "DIVVY CASSETTE REPAIR MOBILE STATION",
-            "TEST",
-            "HQ QR",
-        ]
+        bad_station_regex = r"(?i)(WAREHOUSE|REPAIR|TEST|HQ QR|CHARGING STATION)"
 
-        df_clean = df_silver.filter(
-            ~(
-                F.upper(F.col("start_station_name")).isin(extra_excluded_stations)
-                | F.upper(F.col("end_station_name")).isin(extra_excluded_stations)
+        df_clean = (
+            df_silver.filter(
+                ~(
+                    F.col("start_station_name").rlike(bad_station_regex)
+                    | F.col("end_station_name").rlike(bad_station_regex)
+                )
             )
-        ).withColumn(
-            "start_station_id_norm",
-            F.when(F.col("start_station_id") == "UNKNOWN", F.lit("NON_DOCKING")).otherwise(
-                F.col("start_station_id")
-            ),
-        ).withColumn(
-            "end_station_id_norm",
-            F.when(F.col("end_station_id") == "UNKNOWN", F.lit("NON_DOCKING")).otherwise(
-                F.col("end_station_id")
-            ),
+            .filter(
+                (F.col("start_lat").isNull() | F.col("start_lat").between(41.5, 42.2))
+                & (F.col("start_lng").isNull() | F.col("start_lng").between(-88.1, -87.4))
+                & (F.col("end_lat").isNull() | F.col("end_lat").between(41.5, 42.2))
+                & (F.col("end_lng").isNull() | F.col("end_lng").between(-88.1, -87.4))
+            )
+            .withColumn(
+                "start_station_id_clean",
+                F.regexp_replace(F.trim(F.col("start_station_id")), r"\.0$", ""),
+            )
+            .withColumn(
+                "end_station_id_clean",
+                F.regexp_replace(F.trim(F.col("end_station_id")), r"\.0$", ""),
+            )
+            .withColumn(
+                "start_station_id_norm",
+                F.when(
+                    F.col("start_station_id_clean") == "UNKNOWN", F.lit("NON_DOCKING")
+                ).otherwise(F.col("start_station_id_clean")),
+            )
+            .withColumn(
+                "end_station_id_norm",
+                F.when(
+                    F.col("end_station_id_clean") == "UNKNOWN", F.lit("NON_DOCKING")
+                ).otherwise(F.col("end_station_id_clean")),
+            )
         )
-
+        
         # 3. Ekstrak stasiun fisik unik dari bulan ini & upsert ke dim_stations
         start_st = df_clean.filter(F.col("start_station_id_norm") != "NON_DOCKING").select(
             F.col("start_station_id_norm").alias("station_id"),
