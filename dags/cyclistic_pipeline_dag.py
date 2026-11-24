@@ -32,7 +32,7 @@ with DAG(
     schedule="@monthly",
     catchup=True,
     max_active_runs=1,  # Wajib 1 agar tidak memproses banyak bulan bersamaan (aman untuk RAM 4 GB)
-    tags=["cyclistic", "pyspark", "medallion"],
+    tags=["cyclistic", "pyspark", "medallion", "postgres"],
 ) as dag:
 
     # Task 1: Validasi keberadaan file mentah di Bronze/Raw
@@ -51,6 +51,13 @@ with DAG(
         ),
     )
 
-    # Catatan: Task 3 (transform & load ke Gold Layer PostgreSQL) akan disambungkan di sini
-    # setelah skema Star Schema final dikonfirmasi oleh PM.
-    validate_raw >> transform_silver
+    # Task 3: Agregasi Star Schema & Load ke PostgreSQL Data Warehouse (Gold Layer)
+    load_gold = BashOperator(
+        task_id="load_to_gold_dw",
+        bash_command=(
+            "python /opt/airflow/src/load/load_gold_dw.py "
+            "--month {{ data_interval_start.strftime('%Y%m') }}"
+        ),
+    )
+
+    validate_raw >> transform_silver >> load_gold
