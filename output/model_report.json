@@ -1,0 +1,47 @@
+{
+  "baris_data_dipakai": 5328449,
+  "aturan_pembersihan": "penanda dari Silver",
+  "docked_bike_dikeluarkan": true,
+  "fitur": [
+    "start_lat",
+    "start_lng",
+    "hour_key",
+    "dow",
+    "month",
+    "is_weekend",
+    "is_electric",
+    "station_unknown"
+  ],
+  "ambang_member_like": 0.5,
+  "metrik": [
+    {
+      "model": "Dummy (kelas terbanyak)",
+      "auc_latih": 0.5,
+      "auc_uji": 0.5,
+      "accuracy": 0.5858,
+      "precision": 0.5858,
+      "recall": 1.0,
+      "f1": 0.7388
+    },
+    {
+      "model": "Logistic Regression (baseline)",
+      "auc_latih": 0.6633,
+      "auc_uji": 0.6627,
+      "accuracy": 0.6289,
+      "precision": 0.6523,
+      "recall": 0.7847,
+      "f1": 0.7124
+    },
+    {
+      "model": "Gradient Boosting (model utama)",
+      "auc_latih": 0.7134,
+      "auc_uji": 0.7109,
+      "accuracy": 0.6619,
+      "precision": 0.6848,
+      "recall": 0.7834,
+      "f1": 0.7308
+    }
+  ],
+  "auc_uji_berbasis_waktu": 0.6729524580531352,
+  "sampel_frac": null
+}
