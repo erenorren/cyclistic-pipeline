@@ -1,313 +1,392 @@
+"""
+Cyclistic: Dasbor Pemasaran (Casual vs Member)
+
+Jalankan dari folder cyclistic-pipeline:
+    python -m streamlit run app.py
+
+Sumber data:
+  - data/silver/            -> Parquet per trip (data bersih, dari Data Engineer)
+  - output/ml_targets.csv   -> hasil model (kemiripan pola trip casual dengan member)
+"""
 from pathlib import Path
+
+import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-st.set_page_config(
-    page_title="Cyclistic Marketing & Target Dashboard",
-    layout="wide",
-)
-
+# ----------------------------------------------------------------------------
+# Konfigurasi
+# ----------------------------------------------------------------------------
 SILVER_PATH = Path("data/silver")
-ML_TARGETS_PATH = Path("output/ml_targets.csv")
-CHICAGO_BOUNDS = {
-    "lat": (41.5, 42.2),
-    "lng": (-88.1, -87.4),
+ML_TARGETS_CANDIDATES = [Path("output/ml/ml_targets.csv"), Path("output/ml_targets.csv")]
+
+# Aturan tingkat prioritas yang dipakai saat memuat tabel ke database (src/load/load_ml_targets.py).
+# Samakan dengan skrip Data Engineer bila aturannya berubah.
+TIER_MIN_TRIPS = 30
+TIER_HIGH_SCORE = 1.0   # skor >= ini -> Prioritas Tinggi
+TIER_MID_SCORE = 0.4    # skor > ini  -> Prioritas Sedang
+
+DAY_LABELS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+EN_TO_ID = dict(zip(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], DAY_LABELS))
+COLORS = {"casual": "#E4572E", "member": "#2E86AB"}
+MIN_TRIPS_SHARE_TABLE = 500
+
+# Nama kolom yang mungkin ada di Silver (kolom pertama yang cocok dipakai).
+CANDIDATES = {
+    "user": ["member_casual", "user_type"],
+    "bike": ["rideable_type", "bike_type"],
+    "started_at": ["started_at", "start_time"],
+    "ended_at": ["ended_at", "end_time"],
+    "duration": ["trip_duration_minutes", "duration_min", "ride_length_min"],
+    "distance": ["displacement_km", "distance_km"],
+    "start_id": ["start_station_id"],
+    "start_name": ["start_station_name"],
+    "end_id": ["end_station_id"],
+    "end_name": ["end_station_name"],
+    "lat": ["start_lat"],
+    "lng": ["start_lng"],
+    "false_start": ["is_false_start"],
+    "outlier": ["is_outlier_24h"],
 }
 
-COLUMN_LABELS = {
-    "member_casual": "Tipe Pengguna",
-    "rideable_type": "Jenis Sepeda",
-    "month_label": "Bulan",
-    "day_name": "Hari",
-    "hour_key": "Jam",
-    "start_station_id": "ID Stasiun Awal",
-    "start_station_name": "Nama Stasiun Awal",
-    "total_trips": "Total Perjalanan",
-    "casual_trips": "Perjalanan Casual",
-    "member_trips": "Perjalanan Member",
-    "avg_duration_min": "Rata-Rata Durasi (Menit)",
-    "avg_distance_km": "Rata-Rata Jarak (Km)",
-    "total_casual_trips": "Total Casual Trips",
-    "predicted_member_like_trips": "Predicted Member-Like Trips",
-    "conversion_propensity_score": "Skor Propensi Konversi",
-    "priority_tier": "Tingkat Prioritas",
-}
+st.set_page_config(page_title="Cyclistic: Dasbor Pemasaran", layout="wide")
 
 
-def clean_labels(df: pd.DataFrame) -> pd.DataFrame:
-    renamed = {
-        col: COLUMN_LABELS.get(col, col.replace("_", " ").title())
-        for col in df.columns
+# ----------------------------------------------------------------------------
+# Memuat data
+# ----------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Memuat data Silver (sekali saja)...")
+def load_trips():
+    """Baca Silver, simpan hanya kolom yang dipakai dengan tipe hemat memori."""
+    if not SILVER_PATH.exists():
+        return None, None
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.dataset as ds
+
+    dataset = ds.dataset(str(SILVER_PATH), format="parquet")
+    available = set(dataset.schema.names)
+    m = {k: next((c for c in v if c in available), None) for k, v in CANDIDATES.items()}
+    for must in ("user", "bike", "started_at"):
+        if m[must] is None:
+            raise KeyError(f"Kolom wajib untuk '{must}' tidak ditemukan. Kolom yang ada: {sorted(available)}")
+
+    cols = sorted({c for c in m.values() if c})
+    table = dataset.to_table(columns=cols)
+    for i, field in enumerate(table.schema):  # string -> dictionary agar hemat memori
+        if pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+            table = table.set_column(i, field.name, pc.dictionary_encode(table[field.name]))
+    raw = table.to_pandas()
+
+    started = pd.to_datetime(raw[m["started_at"]])
+    d = pd.DataFrame({
+        "user": raw[m["user"]].astype("category"),
+        "bike": raw[m["bike"]].astype("category"),
+        "month": (started.dt.year * 100 + started.dt.month).astype("int32"),
+        "dow": started.dt.dayofweek.astype("int8"),
+        "hour": started.dt.hour.astype("int8"),
+    })
+
+    # Buang trip yang ditandai kotor di Silver
+    keep = pd.Series(True, index=raw.index)
+    for key in ("false_start", "outlier"):
+        if m[key]:
+            keep &= ~raw[m[key]].fillna(False).astype(bool)
+
+    if m["duration"]:
+        d["duration"] = pd.to_numeric(raw[m["duration"]], errors="coerce").astype("float32")
+    elif m["ended_at"]:
+        d["duration"] = ((pd.to_datetime(raw[m["ended_at"]]) - started).dt.total_seconds() / 60).astype("float32")
+    if m["distance"]:
+        d["distance"] = pd.to_numeric(raw[m["distance"]], errors="coerce").astype("float32")
+    if m["lat"] and m["lng"]:
+        d["lat"] = pd.to_numeric(raw[m["lat"]], errors="coerce").astype("float32")
+        d["lng"] = pd.to_numeric(raw[m["lng"]], errors="coerce").astype("float32")
+
+    for side in ("start", "end"):
+        id_col, name_col = m[f"{side}_id"], m[f"{side}_name"]
+        known = pd.Series(True, index=raw.index)
+        if id_col:
+            sid = raw[id_col].astype("category")
+            known &= ~(sid.isna() | (sid == "UNKNOWN"))
+            d[f"{side}_id"] = sid
+        if name_col:
+            nm = raw[name_col].astype("category")
+            known &= ~(nm.isna() | (nm == "UNKNOWN"))
+            d[f"{side}_name"] = nm
+        if id_col or name_col:
+            d[f"{side}_known"] = known.to_numpy()
+            d[f"{side}_label"] = (d[f"{side}_name"] if name_col else d[f"{side}_id"])
+
+    d = d[keep.to_numpy()].reset_index(drop=True)
+    info = {
+        "start": started[keep.to_numpy()].min(),
+        "end": started[keep.to_numpy()].max(),
+        "dropped": int((~keep).sum()),
+        "has_duration": "duration" in d.columns,
+        "has_distance": "distance" in d.columns,
+        "has_start": "start_label" in d.columns,
+        "has_end": "end_label" in d.columns,
+        "has_geo": "lat" in d.columns,
     }
-    return df.rename(columns=renamed)
-
-
-def assign_priority_tier(row: pd.Series) -> str:
-    trips = row.get("total_casual_trips", 0)
-    score = row.get("conversion_propensity_score", 0.0)
-    if pd.notna(trips) and pd.notna(score) and trips >= 30 and score >= 1.0:
-        return "Prioritas Tinggi"
-    if pd.notna(trips) and pd.notna(score) and trips >= 30 and score > 0.4:
-        return "Prioritas Sedang"
-    return "Rendah"
+    return d, info
 
 
 @st.cache_data
-def load_silver_data(silver_path: Path) -> pd.DataFrame:
-    if not silver_path.exists():
-        return pd.DataFrame()
+def load_ml(path_str: str, name_map: dict | None):
+    df = pd.read_csv(path_str, dtype={"start_station_id": str}, low_memory=False)
+    for col in ("total_casual_trips", "predicted_member_like_trips", "conversion_propensity_score"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    if silver_path.is_dir():
-        files = sorted(silver_path.rglob("*.parquet"))
-        if not files:
-            return pd.DataFrame()
-        df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    else:
-        df = pd.read_parquet(silver_path)
+    def tier(row):
+        if row["total_casual_trips"] >= TIER_MIN_TRIPS and row["conversion_propensity_score"] >= TIER_HIGH_SCORE:
+            return "Prioritas Tinggi"
+        if row["total_casual_trips"] >= TIER_MIN_TRIPS and row["conversion_propensity_score"] > TIER_MID_SCORE:
+            return "Prioritas Sedang"
+        return "Rendah"
 
-    for col in ("is_false_start", "is_outlier_24h"):
-        if col in df.columns:
-            df = df[~df[col].fillna(False).astype(bool)].copy()
-
-    if "rideable_type" in df.columns:
-        df = df[df["rideable_type"] != "docked_bike"].copy()
-
-    if "started_at" in df.columns:
-        started = pd.to_datetime(df["started_at"], errors="coerce")
-        df["month_num"] = started.dt.month
-        df["month_label"] = started.dt.strftime("%Y-%m")
-        df["day_name"] = started.dt.day_name()
-        df["hour_key"] = started.dt.hour
-    else:
-        if "ride_date" in df.columns:
-            rdate = pd.to_datetime(df["ride_date"], errors="coerce")
-            df["month_num"] = rdate.dt.month
-            df["month_label"] = rdate.dt.strftime("%Y-%m")
-        if "start_hour" in df.columns and "hour_key" not in df.columns:
-            df["hour_key"] = pd.to_numeric(df["start_hour"], errors="coerce")
-
-    if "trip_duration_minutes" not in df.columns and "ended_at" in df.columns and "started_at" in df.columns:
-        ended = pd.to_datetime(df["ended_at"], errors="coerce")
-        started = pd.to_datetime(df["started_at"], errors="coerce")
-        df["trip_duration_minutes"] = (ended - started).dt.total_seconds() / 60.0
-
-    for col in ("trip_duration_minutes", "displacement_km", "start_lat", "start_lng", "hour_key"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "start_station_name" not in df.columns and "start_station_id" in df.columns:
-        df["start_station_name"] = df["start_station_id"].astype(str)
-
+    df["priority_tier"] = df.apply(tier, axis=1)
+    df["day_label"] = df["day_name"].map(EN_TO_ID)
+    names = name_map or {}
+    df["station"] = df["start_station_id"].map(names).fillna(df["start_station_id"])
     return df
 
 
-@st.cache_data
-def load_ml_targets(csv_path: Path) -> pd.DataFrame:
-    if not csv_path.exists():
-        return pd.DataFrame()
-    df = pd.read_csv(csv_path, dtype={"start_station_id": str}, low_memory=False)
-    for col, default in [
-        ("total_casual_trips", 0),
-        ("predicted_member_like_trips", 0),
-        ("conversion_propensity_score", 0.0),
-    ]:
-        if col not in df.columns:
-            df[col] = default
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
-    df["priority_tier"] = df.apply(assign_priority_tier, axis=1)
-    return df
+def month_label(m: int) -> str:
+    return f"{m // 100}-{m % 100:02d}"
 
 
-st.title("🚲 Cyclistic Bike-Share Marketing & Target Dashboard")
+def share_within_user(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    c = df.groupby([key, "user"], observed=True).size().rename("n").reset_index()
+    c["persen"] = c["n"] / c.groupby("user", observed=True)["n"].transform("sum") * 100
+    return c
 
-silver_df = load_silver_data(SILVER_PATH)
-ml_df = load_ml_targets(ML_TARGETS_PATH)
 
-if silver_df.empty and ml_df.empty:
-    st.error("Data Silver maupun ml_targets.csv belum ditemukan.")
+def show(fig):
+    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), legend_title_text="")
+    st.plotly_chart(fig)
+
+
+
+
+# ----------------------------------------------------------------------------
+# Halaman
+# ----------------------------------------------------------------------------
+def page_summary(df, info):
+    c1, c2, c3, c4 = st.columns(4)
+    n = len(df)
+    c1.metric("Total perjalanan (filter aktif)", f"{n:,}")
+    share = df["user"].value_counts(normalize=True) * 100
+    c2.metric("Casual / Member", f"{share.get('casual', 0):.1f}% / {share.get('member', 0):.1f}%")
+    if info["has_duration"]:
+        med = df.groupby("user", observed=True)["duration"].median()
+        c3.metric("Median durasi: casual", f"{med.get('casual', float('nan')):.1f} menit")
+        c4.metric("Median durasi: member", f"{med.get('member', float('nan')):.1f} menit")
+
+
+def page_when(df):
+    c1, c2 = st.columns(2)
+
+    h = share_within_user(df, "hour")
+    fig = px.line(h, x="hour", y="persen", color="user", color_discrete_map=COLORS, markers=True,
+                  labels={"hour": "Jam mulai", "persen": "% trip dalam kelompok", "user": ""}, title="Per jam")
+    with c1:
+        show(fig)
+
+    d = share_within_user(df, "dow")
+    d["hari"] = d["dow"].map(dict(enumerate(DAY_LABELS)))
+    fig = px.bar(d, x="hari", y="persen", color="user", barmode="group", color_discrete_map=COLORS,
+                 category_orders={"hari": DAY_LABELS}, labels={"hari": "", "persen": "% trip dalam kelompok"}, title="Per hari")
+    with c2:
+        show(fig)
+
+    c3, c4 = st.columns(2)
+    mth = df.groupby(["month", "user"], observed=True).size().unstack(fill_value=0)
+    mth.index = [month_label(i) for i in mth.index]
+    cnt = mth.rename_axis("bulan").reset_index().melt(id_vars="bulan", var_name="user", value_name="trip")
+    fig = px.line(cnt, x="bulan", y="trip", color="user", color_discrete_map=COLORS, markers=True,
+                  labels={"bulan": "", "trip": "Jumlah trip"}, title="Jumlah trip per bulan")
+    with c3:
+        show(fig)
+
+    if {"casual", "member"}.issubset(mth.columns):
+        pct = (mth["casual"] / (mth["casual"] + mth["member"]) * 100).rename("persen").rename_axis("bulan").reset_index()
+        fig = px.bar(pct, x="bulan", y="persen", labels={"bulan": "", "persen": "% casual dari semua trip"},
+                     title="Porsi casual per bulan", color_discrete_sequence=[COLORS["casual"]])
+        with c4:
+            show(fig)
+
+
+
+def page_duration_bike(df, info):
+    if info["has_duration"]:
+        st.subheader("Durasi perjalanan")
+        s = df.groupby("user", observed=True)["duration"].agg(Median="median", Rata_rata="mean", Persentil_90=lambda x: x.quantile(0.9))
+        st.dataframe(s.round(1).rename(columns={"Rata_rata": "Rata-rata", "Persentil_90": "Persentil 90"}).rename_axis("Tipe"))
+        sample = df.sample(n=min(300_000, len(df)), random_state=1)
+        sample = sample[sample["duration"].between(0, 60)]
+        fig = px.histogram(sample, x="duration", color="user", histnorm="percent", barmode="overlay", nbins=60,
+                           opacity=0.6, color_discrete_map=COLORS,
+                           labels={"duration": "Durasi (menit, dipotong 60)", "user": ""}, title="Sebaran durasi (sampel)")
+        show(fig)
+    else:
+        st.info("Kolom durasi tidak ditemukan di Silver.")
+
+    if info["has_distance"]:
+        st.subheader("Jarak garis lurus titik awal ke titik akhir (km)")
+        dist = df.groupby("user", observed=True)["distance"].agg(Median="median", Rata_rata="mean").round(2)
+        st.dataframe(dist.rename(columns={"Rata_rata": "Rata-rata"}).rename_axis("Tipe"))
+
+    st.subheader("Jenis sepeda")
+    b = share_within_user(df, "bike")
+    fig = px.bar(b, x="bike", y="persen", color="user", barmode="group", color_discrete_map=COLORS,
+                 labels={"bike": "", "persen": "% trip dalam kelompok"}, title="Pilihan jenis sepeda per kelompok")
+    show(fig)
+    tbl = df.groupby(["bike", "user"], observed=True).size().unstack(fill_value=0)
+    st.dataframe(tbl.rename_axis("Jenis sepeda"))
+
+
+def top_stations(df, side, user, n=10):
+    sub = df[(df["user"] == user) & df[f"{side}_known"]]
+    return sub.groupby(f"{side}_label", observed=True).size().sort_values(ascending=False).head(n).rename("Jumlah trip").reset_index() \
+              .rename(columns={f"{side}_label": "Stasiun"})
+
+
+def page_where(df, info):
+    if not (info["has_start"] or info["has_end"]):
+        st.info("Kolom stasiun tidak ditemukan di Silver.")
+        return
+    unk_start = (~df["start_known"]).mean() * 100 if info["has_start"] else 0
+
+    for side, title, ok in (("start", "Stasiun awal", info["has_start"]), ("end", "Stasiun akhir", info["has_end"])):
+        if not ok:
+            continue
+        st.subheader(f"10 {title} terpadat")
+        c1, c2 = st.columns(2)
+        for col, u in zip((c1, c2), ("casual", "member")):
+            with col:
+                st.markdown(f"**{u.capitalize()}**")
+                st.dataframe(top_stations(df, side, u), hide_index=True)
+
+    if info["has_start"] and info["has_geo"]:
+        st.subheader("Peta stasiun awal")
+        who = st.radio("Tampilkan perjalanan", ["casual", "member"], horizontal=True)
+        sub = df[(df["user"] == who) & df["start_known"]]
+        g = sub.groupby("start_label", observed=True).agg(lat=("lat", "mean"), lon=("lng", "mean"), trips=("lat", "size")).dropna().reset_index()
+        g = g[g["lat"].between(41.5, 42.2) & g["lon"].between(-88.1, -87.4)]
+        g["size"] = 20 + np.sqrt(g["trips"]) * 4
+        g[["lat", "lon", "size"]] = g[["lat", "lon", "size"]].astype("float64")
+        st.map(g, latitude="lat", longitude="lon", size="size")
+
+        st.subheader(f"Stasiun dengan porsi casual tertinggi (minimal {MIN_TRIPS_SHARE_TABLE} trip)")
+        allst = df[df["start_known"]].groupby(["start_label", "user"], observed=True).size().unstack(fill_value=0)
+        if {"casual", "member"}.issubset(allst.columns):
+            allst["Total trip"] = allst["casual"] + allst["member"]
+            allst = allst[allst["Total trip"] >= MIN_TRIPS_SHARE_TABLE]
+            allst["Porsi casual (%)"] = (allst["casual"] / allst["Total trip"] * 100).round(1)
+            st.dataframe(allst.sort_values("Porsi casual (%)", ascending=False).head(15)[["Total trip", "Porsi casual (%)"]].rename_axis("Stasiun"))
+
+
+def page_model(ml, info):
+    if ml is None:
+        st.info("File ml_targets.csv belum ditemukan di folder output.")
+        return
+    tot, mirip = ml["total_casual_trips"].sum(), ml["predicted_member_like_trips"].sum()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Trip casual yang dinilai model", f"{int(tot):,}")
+    c2.metric("Trip casual dengan pola mirip member", f"{int(mirip):,}")
+    c3.metric("% trip casual dengan pola mirip member", f"{mirip / tot * 100:.1f}%" if tot else "-")
+
+    tiers = ml["priority_tier"].value_counts()
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Sel Prioritas Tinggi", f"{int(tiers.get('Prioritas Tinggi', 0)):,}")
+    t2.metric("Sel Prioritas Sedang", f"{int(tiers.get('Prioritas Sedang', 0)):,}")
+    t3.metric("Sel Rendah", f"{int(tiers.get('Rendah', 0)):,}")
+
+    def ratio(key):
+        g = ml.groupby(key).agg(total=("total_casual_trips", "sum"), mirip=("predicted_member_like_trips", "sum")).reset_index()
+        g["persen"] = g["mirip"] / g["total"] * 100
+        return g
+
+    c1, c2 = st.columns(2)
+    with c1:
+        show(px.line(ratio("hour_key"), x="hour_key", y="persen", markers=True,
+                     labels={"hour_key": "Jam", "persen": "% trip casual mirip member"}, title="Per jam"))
+    with c2:
+        gd = ratio("day_label")
+        show(px.bar(gd, x="day_label", y="persen", category_orders={"day_label": DAY_LABELS},
+                    labels={"day_label": "", "persen": "% trip casual mirip member"}, title="Per hari"))
+    show(px.bar(ratio("rideable_type"), x="rideable_type", y="persen",
+                labels={"rideable_type": "", "persen": "% trip casual mirip member"}, title="Per jenis sepeda"))
+
+    st.subheader("Sel dengan prioritas tertinggi")
+    f1, f2 = st.columns(2)
+    avail = [t for t in ["Prioritas Tinggi", "Prioritas Sedang", "Rendah"] if t in tiers.index]
+    sel = f1.multiselect("Tingkat prioritas", avail, default=avail[:2] or avail)
+    min_t = f2.slider("Minimal trip casual per sel", 0, int(ml["total_casual_trips"].max()), TIER_MIN_TRIPS)
+    view = ml[ml["priority_tier"].isin(sel) & (ml["total_casual_trips"] >= min_t)]
+    view = view.sort_values(["conversion_propensity_score", "total_casual_trips"], ascending=False).head(50)
+    out = view[["station", "day_label", "hour_key", "rideable_type", "total_casual_trips",
+                "predicted_member_like_trips", "conversion_propensity_score", "priority_tier"]]
+    out.columns = ["Stasiun", "Hari", "Jam", "Jenis sepeda", "Trip casual", "Trip mirip member", "Skor kemiripan pola", "Tingkat prioritas"]
+    st.dataframe(out, hide_index=True)
+
+
+
+
+# ----------------------------------------------------------------------------
+# Aplikasi
+# ----------------------------------------------------------------------------
+st.title("🚲 Cyclistic: Casual vs Member")
+
+trips, info = load_trips()
+
+name_map = None
+if trips is not None and info["has_start"] and "start_id" in trips.columns and "start_name" in trips.columns:
+    pairs = trips.loc[trips["start_known"], ["start_id", "start_name"]].drop_duplicates()
+    name_map = dict(zip(pairs["start_id"].astype(str), pairs["start_name"].astype(str)))
+
+ml_path = next((p for p in ML_TARGETS_CANDIDATES if p.exists()), None)
+ml = load_ml(str(ml_path), name_map) if ml_path else None
+
+if trips is None and ml is None:
+    st.error("Data Silver (data/silver) dan ml_targets.csv belum ditemukan. Letakkan keduanya sesuai konfigurasi di bagian atas app.py.")
     st.stop()
 
-# Sidebar Filter
-st.sidebar.header("Filter Dashboard")
+if trips is None:
+    st.warning("Data Silver belum ditemukan, hanya halaman hasil model yang ditampilkan.")
+    page_model(ml, None)
+    st.stop()
 
-filtered_silver = silver_df.copy()
-if not filtered_silver.empty:
-    if "month_label" in filtered_silver.columns:
-        months = sorted(filtered_silver["month_label"].dropna().unique().tolist())
-        sel_months = st.sidebar.multiselect("Bulan", options=months, default=months)
-        filtered_silver = filtered_silver[filtered_silver["month_label"].isin(sel_months)]
+# Filter
+st.sidebar.header("Filter")
+months = sorted(trips["month"].unique().tolist())
+sel_m = st.sidebar.multiselect("Bulan", months, default=months, format_func=month_label)
+bikes = sorted(trips["bike"].dropna().unique().tolist())
+sel_b = st.sidebar.multiselect("Jenis sepeda", bikes, default=bikes)
+users = sorted(trips["user"].dropna().unique().tolist())
+sel_u = st.sidebar.multiselect("Tipe pengguna", users, default=users)
+daytype = st.sidebar.radio("Hari", ["Semua", "Hari kerja", "Akhir pekan"])
 
-    if "member_casual" in filtered_silver.columns:
-        users = sorted(filtered_silver["member_casual"].dropna().unique().tolist())
-        sel_users = st.sidebar.multiselect("Tipe Pengguna", options=users, default=users)
-        filtered_silver = filtered_silver[filtered_silver["member_casual"].isin(sel_users)]
+mask = trips["month"].isin(sel_m) & trips["bike"].isin(sel_b) & trips["user"].isin(sel_u)
+if daytype == "Hari kerja":
+    mask &= trips["dow"] < 5
+elif daytype == "Akhir pekan":
+    mask &= trips["dow"] >= 5
+df = trips[mask]
+if df.empty:
+    st.warning("Tidak ada data untuk kombinasi filter ini.")
+    st.stop()
 
-    if "rideable_type" in filtered_silver.columns:
-        bikes = sorted(filtered_silver["rideable_type"].dropna().unique().tolist())
-        sel_bikes = st.sidebar.multiselect("Jenis Sepeda", options=bikes, default=bikes)
-        filtered_silver = filtered_silver[filtered_silver["rideable_type"].isin(sel_bikes)]
-
-filtered_ml = ml_df.copy()
-if not filtered_ml.empty:
-    tier_opts = ["Prioritas Tinggi", "Prioritas Sedang", "Rendah"]
-    avail_tiers = [t for t in tier_opts if t in filtered_ml["priority_tier"].unique()]
-    sel_tiers = st.sidebar.multiselect("Tingkat Prioritas Target", options=avail_tiers, default=avail_tiers)
-    min_trips = st.sidebar.slider(
-        "Minimum Casual Trips per Sel",
-        min_value=0,
-        max_value=max(int(filtered_ml["total_casual_trips"].max()), 1),
-        value=0,
-        step=5,
-    )
-    filtered_ml = filtered_ml[
-        filtered_ml["priority_tier"].isin(sel_tiers)
-        & (filtered_ml["total_casual_trips"] >= min_trips)
-    ]
-
-# Bagian 1: Ringkasan Angka Penting
-with st.container(border=True):
-    st.subheader("1. Ringkasan")
-    c1, c2, c3, c4 = st.columns(4)
-
-    total_trips = len(filtered_silver) if not filtered_silver.empty else int(filtered_ml["total_casual_trips"].sum())
-    with c1:
-        with st.container(border=True):
-            st.metric("Total Perjalanan", f"{total_trips:,}")
-
-    with c2:
-        with st.container(border=True):
-            if not filtered_silver.empty and "member_casual" in filtered_silver.columns and len(filtered_silver) > 0:
-                casual_pct = (filtered_silver["member_casual"] == "casual").mean() * 100
-                member_pct = 100.0 - casual_pct
-                st.metric("Member vs Casual", f"{member_pct:.1f}% / {casual_pct:.1f}%")
-            else:
-                st.metric("Member vs Casual", "-")
-
-    with c3:
-        with st.container(border=True):
-            if not filtered_silver.empty and "member_casual" in filtered_silver.columns and "trip_duration_minutes" in filtered_silver.columns:
-                dur_user = filtered_silver.groupby("member_casual")["trip_duration_minutes"].mean()
-                avg_c = dur_user.get("casual", 0.0)
-                avg_m = dur_user.get("member", 0.0)
-                st.metric("Rata-Rata Durasi (Casual / Member)", f"{avg_c:.1f}m / {avg_m:.1f}m")
-            else:
-                st.metric("Rata-Rata Durasi (Casual / Member)", "-")
-
-    with c4:
-        with st.container(border=True):
-            if not filtered_ml.empty and filtered_ml["total_casual_trips"].sum() > 0:
-                commuter_pct = (
-                    filtered_ml["predicted_member_like_trips"].sum()
-                    / filtered_ml["total_casual_trips"].sum()
-                    * 100
-                )
-                st.metric("Casual Berpola Mirip Member", f"{commuter_pct:.1f}%")
-            else:
-                st.metric("Casual Berpola Mirip Member", "-")
-
-# Bagian 2: Grafik Waktu Bersepeda
-with st.container(border=True):
-    st.subheader("2. Grafik Waktu Bersepeda")
-    if not filtered_silver.empty and "member_casual" in filtered_silver.columns:
-        t1, t2, t3 = st.columns(3)
-
-        with t1:
-            st.markdown("**Grafik Bulanan**")
-            if "month_label" in filtered_silver.columns:
-                m_df = (
-                    filtered_silver.groupby(["month_label", "member_casual"])
-                    .size()
-                    .unstack(fill_value=0)
-                    .sort_index()
-                )
-                st.bar_chart(clean_labels(m_df))
-
-        with t2:
-            st.markdown("**Grafik Hari (Senin – Minggu)**")
-            if "day_name" in filtered_silver.columns:
-                day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-                d_df = (
-                    filtered_silver.groupby(["day_name", "member_casual"])
-                    .size()
-                    .unstack(fill_value=0)
-                    .reindex(day_order)
-                    .dropna(how="all")
-                )
-                st.bar_chart(clean_labels(d_df))
-
-        with t3:
-            st.markdown("**Grafik Jam (0 – 23)**")
-            if "hour_key" in filtered_silver.columns:
-                h_df = (
-                    filtered_silver.groupby(["hour_key", "member_casual"])
-                    .size()
-                    .unstack(fill_value=0)
-                    .sort_index()
-                )
-                st.bar_chart(clean_labels(h_df))
-    else:
-        st.info("Data Silver belum tersedia untuk grafik waktu.")
-
-# Bagian 3: Peta & Daftar Stasiun Paling Ramai
-with st.container(border=True):
-    st.subheader("3. Peta & Daftar Stasiun Paling Ramai (Casual)")
-    if not filtered_silver.empty and "member_casual" in filtered_silver.columns:
-        casual_silver = filtered_silver[filtered_silver["member_casual"] == "casual"].copy()
-        left_map, right_top = st.columns([1.2, 1])
-
-        with left_map:
-            st.markdown("**Peta Kota Chicago (Perjalanan Casual)**")
-            if {"start_lat", "start_lng"}.issubset(casual_silver.columns):
-                map_df = casual_silver.dropna(subset=["start_lat", "start_lng"])
-                map_df = map_df[
-                    map_df["start_lat"].between(*CHICAGO_BOUNDS["lat"])
-                    & map_df["start_lng"].between(*CHICAGO_BOUNDS["lng"])
-                ]
-                if not map_df.empty:
-                    st.map(map_df.rename(columns={"start_lat": "lat", "start_lng": "lon"})[["lat", "lon"]])
-                else:
-                    st.info("Tidak ada koordinat stasiun Chicago pada filter aktif.")
-
-        with right_top:
-            st.markdown("**10 Stasiun Awal Terpadat (Casual)**")
-            if "start_station_name" in casual_silver.columns:
-                top_st = (
-                    casual_silver.groupby("start_station_name", dropna=False)
-                    .size()
-                    .reset_index(name="total_trips")
-                    .sort_values("total_trips", ascending=False)
-                    .head(10)
-                )
-                st.dataframe(clean_labels(top_st), use_container_width=True, hide_index=True)
-    else:
-        st.info("Data Silver belum tersedia untuk peta dan daftar stasiun.")
-
-# Bagian 4: Grafik Jenis Sepeda & Ciri Perjalanan Target Promo
-with st.container(border=True):
-    st.subheader("4. Jenis Sepeda & Ciri Perjalanan Target Promo")
-    b_col, ml_col = st.columns(2)
-
-    with b_col:
-        st.markdown("**Pilihan Jenis Sepeda (Perjalanan & Rata-Rata Jarak)**")
-        if not filtered_silver.empty and "rideable_type" in filtered_silver.columns:
-            agg_spec = {"total_trips": ("rideable_type", "count")}
-            if "displacement_km" in filtered_silver.columns:
-                agg_spec["avg_distance_km"] = ("displacement_km", "mean")
-            bike_df = filtered_silver.groupby("rideable_type", dropna=False).agg(**agg_spec).reset_index()
-            if "avg_distance_km" in bike_df.columns:
-                bike_df["avg_distance_km"] = bike_df["avg_distance_km"].round(2)
-            st.dataframe(clean_labels(bike_df), use_container_width=True, hide_index=True)
-            st.bar_chart(bike_df.set_index("rideable_type")["total_trips"].rename("Total Perjalanan"))
-        else:
-            st.info("Data jenis sepeda belum tersedia.")
-
-    with ml_col:
-        st.markdown("**Ciri Perjalanan Target Promo (Hasil Model ML)**")
-        if not filtered_ml.empty:
-            top_promo = filtered_ml.sort_values(
-                by=["conversion_propensity_score", "total_casual_trips"],
-                ascending=[False, False],
-            ).head(25)
-            st.dataframe(clean_labels(top_promo), use_container_width=True, hide_index=True)
-        else:
-            st.info("Data ml_targets.csv belum tersedia.")
+tabs = st.tabs(["Ringkasan", "Kapan", "Durasi & sepeda", "Di mana", "Target promosi"])
+with tabs[0]:
+    page_summary(df, info)
+with tabs[1]:
+    page_when(df)
+with tabs[2]:
+    page_duration_bike(df, info)
+with tabs[3]:
+    page_where(df, info)
+with tabs[4]:
+    page_model(ml, info)
