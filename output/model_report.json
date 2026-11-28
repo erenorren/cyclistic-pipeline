@@ -25,23 +25,23 @@
     },
     {
       "model": "Logistic Regression (baseline)",
-      "auc_latih": 0.6633,
-      "auc_uji": 0.6627,
-      "accuracy": 0.6289,
-      "precision": 0.6523,
-      "recall": 0.7847,
-      "f1": 0.7124
+      "auc_latih": 0.6646,
+      "auc_uji": 0.6641,
+      "accuracy": 0.6301,
+      "precision": 0.6531,
+      "recall": 0.7863,
+      "f1": 0.7135
     },
     {
       "model": "Gradient Boosting (model utama)",
-      "auc_latih": 0.7134,
-      "auc_uji": 0.7109,
+      "auc_latih": 0.7137,
+      "auc_uji": 0.7113,
       "accuracy": 0.6619,
-      "precision": 0.6848,
-      "recall": 0.7834,
+      "precision": 0.685,
+      "recall": 0.7831,
       "f1": 0.7308
     }
   ],
-  "auc_uji_berbasis_waktu": 0.6729524580531352,
+  "auc_uji_berbasis_waktu": 0.6771387837084963,
   "sampel_frac": null
 }
